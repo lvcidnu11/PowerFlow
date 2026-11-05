@@ -30,7 +30,7 @@ devices charging from its USB-C ports** (e.g. an iPhone).
 Requires Xcode command line tools (Swift 5.9+), macOS 14+.
 
 ```bash
-git clone https://github.com/<you>/PowerFlow.git
+git clone https://github.com/lvcidnu11/PowerFlow.git
 cd PowerFlow
 ./build.sh
 open PowerFlow.app
