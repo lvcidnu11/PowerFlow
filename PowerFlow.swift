@@ -158,11 +158,16 @@ private var symbolCache: [String: NSTextAttachment] = [:]
 func symbol(_ name: String, _ color: NSColor? = nil, size: CGFloat = 12) -> NSTextAttachment {
     let key = "\(name)|\(color?.description ?? "-")|\(size)"
     if let a = symbolCache[key] { return a }
-    var cfg = NSImage.SymbolConfiguration(pointSize: size, weight: .medium)
+    // Battery glyphs are drawn short and wide; Apple's "large" symbol scale enlarges them while
+    // keeping the stroke weight of the neighbouring bolt / device icons.
+    var cfg = NSImage.SymbolConfiguration(pointSize: size, weight: .medium, scale: name.hasPrefix("battery") ? .large : .medium)
     if let color { cfg = cfg.applying(.init(paletteColors: [color])) }
     let a = NSTextAttachment()
     a.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
-    if let s = a.image?.size { a.bounds = CGRect(x: 0, y: -2, width: s.width, height: s.height) }
+    // Centre every glyph on the digits' cap height so all icons share one midline.
+    if let s = a.image?.size {
+        a.bounds = CGRect(x: 0, y: (NSFont.systemFont(ofSize: size).capHeight - s.height) / 2, width: s.width, height: s.height)
+    }
     symbolCache[key] = a
     return a
 }
