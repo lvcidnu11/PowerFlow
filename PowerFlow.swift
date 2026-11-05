@@ -245,11 +245,12 @@ final class FlowView: NSView {
 // MARK: - History (fixed-size ring buffer, drawn only when visible)
 
 final class HistoryView: NSView {
-    static let capacity = 200               // ≈ 10 min at 3 s
-    private var series = [[Float]](repeating: [], count: 4)  // in, battery, mac, devices
+    static let interval = 3.0, capacity = 200  // ≈ 10 min
+    private var series = [[Float]](repeating: [], count: 4)  // charger, battery, mac, devices
     private let colors = [C.adapter, C.battery, C.mac, C.device]
+    private let names = ["Charger", "Battery", "Mac", "Devices"]
     override var isFlipped: Bool { true }
-    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 90) }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 120) }
 
     func push(_ r: Reading) {
         for (i, v) in [r.inW, r.batteryW, r.macW, r.devicesW].enumerated() {
@@ -260,21 +261,55 @@ final class HistoryView: NSView {
     }
 
     override func draw(_ dirty: NSRect) {
-        let lo = min(0, series.flatMap { $0 }.min() ?? 0), hi = max(1, series.flatMap { $0 }.max() ?? 1)
-        let plot = bounds.insetBy(dx: 2, dy: 14)
-        func y(_ v: Float) -> CGFloat { plot.maxY - CGFloat((v - lo) / (hi - lo)) * plot.height }
-        NSColor.separatorColor.setStroke()
-        let zero = NSBezierPath(); zero.move(to: NSPoint(x: plot.minX, y: y(0))); zero.line(to: NSPoint(x: plot.maxX, y: y(0))); zero.stroke()
-        for (s, c) in zip(series, colors) where s.count > 1 {
-            let p = NSBezierPath(); p.lineWidth = 1.5
-            for (i, v) in s.enumerated() {
-                let pt = NSPoint(x: plot.maxX - CGFloat(s.count - 1 - i) * plot.width / CGFloat(Self.capacity - 1), y: y(v))
-                i == 0 ? p.move(to: pt) : p.line(to: pt)
-            }
-            c.setStroke(); p.stroke()
+        // Only series that ever carried power (e.g. hide "Devices" when nothing is plugged in).
+        let shown = series.indices.filter { i in series[i].contains { abs($0) > 0.3 } }
+        let all = shown.flatMap { series[$0] }
+        let lo = min(0, all.min() ?? 0), hi = max(5, all.max() ?? 5)
+
+        // Legend: dot, name, latest value.
+        var x: CGFloat = 0
+        for i in shown {
+            let s = NSMutableAttributedString(attachment: symbol("circle.fill", colors[i], size: 7))
+            s.append(text(String(format: " %@ %.0f W", names[i], series[i].last ?? 0), 10, .medium, .secondaryLabelColor))
+            s.draw(at: NSPoint(x: x, y: 0)); x += s.size().width + 12
         }
-        text("Last 10 min", 10, .regular, .tertiaryLabelColor).draw(at: NSPoint(x: plot.minX, y: 0))
-        text(String(format: "%.0f W", hi), 10, .regular, .tertiaryLabelColor).draw(at: NSPoint(x: plot.maxX - 34, y: 0))
+
+        let plot = NSRect(x: 0, y: 22, width: bounds.width, height: bounds.height - 40)
+        func y(_ v: Float) -> CGFloat { plot.maxY - CGFloat((v - lo) / (hi - lo)) * plot.height }
+        let n = series[0].count
+        let step = plot.width / CGFloat(max(n - 1, 1))  // stretch over what has been recorded so far
+
+        // Faint guides at 0 and the top value.
+        NSColor.separatorColor.setStroke()
+        for v in [lo, hi] { let g = NSBezierPath(); g.move(to: NSPoint(x: plot.minX, y: y(v))); g.line(to: NSPoint(x: plot.maxX, y: y(v))); g.lineWidth = 0.5; g.stroke() }
+        if lo < 0 { let g = NSBezierPath(); g.move(to: NSPoint(x: plot.minX, y: y(0))); g.line(to: NSPoint(x: plot.maxX, y: y(0))); g.lineWidth = 0.5; g.stroke() }
+
+        for i in shown where series[i].count > 1 {
+            let p = NSBezierPath(); p.lineWidth = 1.6; p.lineJoinStyle = .round
+            for (j, v) in series[i].enumerated() {
+                let pt = NSPoint(x: plot.minX + CGFloat(j) * step, y: y(v))
+                j == 0 ? p.move(to: pt) : p.line(to: pt)
+            }
+            colors[i].setStroke(); p.stroke()
+        }
+
+        let secs = Double(max(n - 1, 0)) * Self.interval
+        let span = secs < 60 ? "Last \(Int(secs)) s" : "Last \(Int((secs / 60).rounded())) min"
+        text(span, 10, .regular, .secondaryLabelColor).draw(at: NSPoint(x: plot.minX, y: plot.maxY + 4))
+        let scale = text(String(format: "scale %.0f–%.0f W", lo, hi), 10, .regular, .tertiaryLabelColor)
+        scale.draw(at: NSPoint(x: plot.maxX - scale.size().width, y: plot.maxY + 4))
+    }
+
+    /// Fills the buffer with a plausible 10-minute trace (used by --snapshot --demo).
+    func seedDemo(_ r: Reading) {
+        for k in 0..<Self.capacity {
+            let t = Double(k) / Double(Self.capacity), wobble = sin(t * 9) * 3
+            var d = r
+            d.batteryW = r.batteryW + 4 * (1 - t) + wobble * 0.3
+            d.loadW = r.loadW + wobble + (t > 0.6 ? 4 : 0)
+            d.inW = d.batteryW + d.loadW
+            push(d)
+        }
     }
 }
 
@@ -421,7 +456,10 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLi
     for (name, look) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
         let p = Panel(); p.view.appearance = NSAppearance(named: look)
         p.show(r, health: reader.health, cycles: reader.cycles)
-        if CommandLine.arguments.contains("--details") { p.history.push(r); p.perform(Selector(("toggleDetails"))) }
+        if CommandLine.arguments.contains("--details") {
+            CommandLine.arguments.contains("--demo") ? p.history.seedDemo(r) : p.history.push(r)
+            p.perform(Selector(("toggleDetails")))
+        }
         let v = p.view; v.frame.size = v.fittingSize; v.layoutSubtreeIfNeeded()
         let bg = NSView(frame: v.bounds); bg.wantsLayer = true; bg.appearance = v.appearance
         bg.layer?.backgroundColor = (look == .aqua ? NSColor(white: 0.96, alpha: 1) : NSColor(white: 0.16, alpha: 1)).cgColor
