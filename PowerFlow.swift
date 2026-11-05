@@ -11,11 +11,52 @@ struct PortDevice: Identifiable, Hashable {
     let watts: Double
     let volts: Double
     let amps: Double
-    let vendorID: Int
-    let deviceSoC: Int?  // the attached device's own battery %, if it reports one
+    let vendorID: Int        // from USB-C PD negotiation (works even on charge-only cables)
+    let deviceSoC: Int?      // the attached device's own battery %, if it reports one over PD
+    let productName: String? // from USB enumeration ("iPhone", "iPad", ...) — needs a data cable
+
     var label: String {
-        let vendor = vendorID == 1452 ? "Apple device" : (vendorID == 0 ? "USB device" : "Device")
-        return "\(vendor) · port \(id)"
+        if let p = productName, !p.isEmpty { return p }
+        return vendorID == 1452 ? "Apple device" : "USB-C device"
+    }
+
+    /// SF Symbol for the device, guessed from its USB product name.
+    var symbol: String {
+        let n = (productName ?? "").lowercased()
+        let table: [(String, String)] = [
+            ("iphone", "iphone"), ("ipad", "ipad"), ("watch", "applewatch"),
+            ("airpods max", "airpodsmax"), ("airpods pro", "airpodspro.chargingcase.wireless"),
+            ("airpods", "airpods.chargingcase"), ("pencil", "applepencil"),
+            ("keyboard", "keyboard"), ("mouse", "magicmouse"), ("trackpad", "rectangle.and.hand.point.up.left"),
+            ("macbook", "laptopcomputer"), ("ipod", "ipod"), ("vision", "visionpro"),
+            ("pixel", "smartphone"), ("galaxy", "smartphone"), ("android", "smartphone"), ("phone", "smartphone"),
+            ("tab", "ipad.landscape"), ("power bank", "battery.100percent"), ("battery", "battery.100percent"),
+            ("headphone", "headphones"), ("controller", "gamecontroller"), ("camera", "camera"),
+            ("ssd", "externaldrive"), ("drive", "externaldrive"), ("disk", "externaldrive"),
+        ]
+        if let hit = table.first(where: { n.contains($0.0) }) { return hit.1 }
+        return "cable.connector"
+    }
+}
+
+/// Connected USB devices keyed by USB-C port index.
+/// On Apple Silicon each USB-C port has its own XHCI controller; the top byte of a device's
+/// locationID is that controller's index, and port index = controller index + 1.
+enum USBDevices {
+    static func byPort() -> [Int: String] {
+        var result: [Int: String] = [:]
+        var iter: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOUSBHostDevice"), &iter) == KERN_SUCCESS else { return [:] }
+        defer { IOObjectRelease(iter) }
+        while case let dev = IOIteratorNext(iter), dev != 0 {
+            defer { IOObjectRelease(dev) }
+            func prop(_ k: String) -> Any? { IORegistryEntryCreateCFProperty(dev, k as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() }
+            guard let name = (prop("USB Product Name") ?? prop("kUSBProductString")) as? String,
+                  let loc = (prop("locationID") as? NSNumber)?.uint32Value else { continue }
+            let port = Int(loc >> 24) + 1
+            if result[port] == nil { result[port] = name }  // first (top-level) device on that port
+        }
+        return result
     }
 }
 
@@ -70,17 +111,22 @@ enum BatteryReader {
 
         let fed = d["FedDetails"] as? [[String: Any]] ?? []
         let outs = d["PowerOutDetails"] as? [[String: Any]] ?? []
+        let usb = USBDevices.byPort()
+        let poweredPorts = outs.filter { Double(i($0["Watts"])) > 50 }.count
         let devices: [PortDevice] = outs.compactMap { o in
             let w = Double(i(o["Watts"])) / 1000
             guard w > 0.05 else { return nil }
             let port = Int(i(o["PortIndex"]))
             let f = (port - 1 >= 0 && port - 1 < fed.count) ? fed[port - 1] : [:]
             let soc = Int(i(f["FedStateOfCharge"]))
+            // Fall back to the only USB device when exactly one port is powering something.
+            let name = usb[port] ?? (poweredPorts == 1 && usb.count == 1 ? usb.values.first : nil)
             return PortDevice(id: port, watts: w,
                               volts: Double(i(o["AdapterVoltage"])) / 1000,
                               amps: Double(i(o["Current"])) / 1000,
                               vendorID: Int(i(f["FedVendorID"])),
-                              deviceSoC: soc > 0 ? soc : nil)
+                              deviceSoC: soc > 0 ? soc : nil,
+                              productName: name)
         }
 
         let remaining = Int(i(d["TimeRemaining"]))
@@ -123,13 +169,30 @@ final class PowerMonitor: ObservableObject {
         if history.count > maxHistory { history.removeFirst(history.count - maxHistory) }
     }
 
-    var menuTitle: String {
-        guard let s = current else { return "⚡︎ --" }
-        if s.adapterConnected {
-            let dev = s.devicesW > 0.05 ? String(format: " 📱%.0f", s.devicesW) : ""
-            return String(format: "⚡︎%.0fW 🔋%+.0f%@", s.systemInW, s.batteryW, dev)
+    /// Menu bar label built from SF Symbols (template images, so they follow the menu bar's tint).
+    var menuLabel: Text {
+        guard let s = current else { return Text(Image(systemName: "bolt.fill")) + Text(" --") }
+        let batt = Text(Image(systemName: batterySymbol(s.percent, charging: s.batteryW > 0.3)))
+        if !s.adapterConnected {
+            return batt + Text(String(format: " %.0fW", s.batteryOutW))
         }
-        return String(format: "🔋%.0fW", s.batteryOutW)
+        var t = Text(Image(systemName: "bolt.fill")) + Text(String(format: "%.0fW", s.systemInW))
+            + Text("  ") + batt + Text(String(format: " %+.0f", s.batteryW))
+        for d in s.devices {
+            t = t + Text("  ") + Text(Image(systemName: d.symbol)) + Text(String(format: " %.0f", d.watts))
+        }
+        return t
+    }
+}
+
+func batterySymbol(_ percent: Int, charging: Bool) -> String {
+    if charging && percent >= 95 { return "battery.100percent.bolt" }
+    switch percent {
+    case ..<13: return "battery.0percent"
+    case ..<38: return "battery.25percent"
+    case ..<63: return "battery.50percent"
+    case ..<88: return "battery.75percent"
+    default:    return "battery.100percent"
     }
 }
 
@@ -148,6 +211,7 @@ enum Palette {
 struct FlowNode: Identifiable {
     let id: String
     let title: String
+    let symbol: String
     let watts: Double
     let color: Color
 }
@@ -205,9 +269,10 @@ struct SankeyView: View {
 
             func drawLabel(_ n: FlowNode, _ r: CGRect, leftSide: Bool) {
                 ctx.fill(Path(roundedRect: r, cornerRadius: 3), with: .color(n.color))
-                let text = Text("\(n.title)\n").font(.system(size: 12, weight: .medium))
+                let text = Text(Image(systemName: n.symbol)).font(.system(size: 12, weight: .medium)).foregroundColor(n.color)
+                    + Text(" \(n.title)\n").font(.system(size: 12, weight: .medium))
                     + Text(String(format: "%.1f W", n.watts)).font(.system(size: 15, weight: .semibold).monospacedDigit())
-                let resolved = ctx.resolve(text.foregroundColor(.primary))
+                let resolved = ctx.resolve(text)
                 if leftSide {
                     ctx.draw(resolved, at: CGPoint(x: r.minX - 8, y: r.midY), anchor: .trailing)
                 } else {
@@ -252,23 +317,24 @@ struct ContentView: View {
         var src: [FlowNode] = []
         var snk: [FlowNode] = []
         if s.adapterConnected && s.systemInW > 0.05 {
-            src.append(.init(id: "adapter", title: String(format: "Adapter (%.0f W, %.0f V)", s.adapterRatedW, s.adapterVolts), watts: s.systemInW, color: Palette.adapter))
+            src.append(.init(id: "adapter", title: String(format: "Adapter · %.0f W", s.adapterRatedW), symbol: "powerplug.portrait.fill", watts: s.systemInW, color: Palette.adapter))
         }
+        let battSym = batterySymbol(s.percent, charging: false)
         if s.batteryOutW > 0.05 {
-            src.append(.init(id: "battout", title: "Battery (discharging)", watts: s.batteryOutW, color: Palette.battery))
+            src.append(.init(id: "battout", title: "Battery", symbol: battSym, watts: s.batteryOutW, color: Palette.battery))
         }
         if s.batteryInW > 0.05 {
-            snk.append(.init(id: "battin", title: "Into battery", watts: s.batteryInW, color: Palette.battery))
+            snk.append(.init(id: "battin", title: "Battery", symbol: battSym, watts: s.batteryInW, color: Palette.battery))
         }
-        snk.append(.init(id: "mac", title: "Mac (CPU, screen, …)", watts: s.macW, color: Palette.mac))
+        snk.append(.init(id: "mac", title: "This Mac", symbol: "laptopcomputer", watts: s.macW, color: Palette.mac))
         for d in s.devices {
             let soc = d.deviceSoC.map { " · \($0)%" } ?? ""
-            snk.append(.init(id: "dev\(d.id)", title: d.label + soc, watts: d.watts, color: Palette.device))
+            snk.append(.init(id: "dev\(d.id)", title: d.label + soc, symbol: d.symbol, watts: d.watts, color: Palette.device))
         }
         // Rounding mismatch between independently-measured telemetry values
         let srcSum = src.reduce(0) { $0 + $1.watts }, snkSum = snk.reduce(0) { $0 + $1.watts }
         if srcSum - snkSum > 0.5 {
-            snk.append(.init(id: "other", title: "Unaccounted / conversion", watts: srcSum - snkSum, color: Palette.loss))
+            snk.append(.init(id: "other", title: "Conversion / other", symbol: "arrow.triangle.branch", watts: srcSum - snkSum, color: Palette.loss))
         }
         return (src, snk)
     }
@@ -354,6 +420,19 @@ struct ContentView: View {
 struct PowerFlowApp: App {
     @StateObject private var monitor = PowerMonitor()
 
+    init() {
+        // `PowerFlow.app/Contents/MacOS/PowerFlow --dump` prints one reading and exits (handy for bug reports).
+        if CommandLine.arguments.contains("--dump") {
+            if let s = BatteryReader.read() {
+                print(String(format: "adapter=%@ in=%.1fW battery=%+.1fW mac=%.1fW percent=%d", s.adapterConnected ? "yes" : "no", s.systemInW, s.batteryW, s.macW, s.percent))
+                for d in s.devices {
+                    print(String(format: "port %d: %@ [%@] %.1fW (%.2fV %.2fA) soc=%@ vendor=%d", d.id, d.label, d.symbol, d.watts, d.volts, d.amps, d.deviceSoC.map(String.init) ?? "-", d.vendorID))
+                }
+            } else { print("no AppleSmartBattery") }
+            exit(0)
+        }
+    }
+
     var body: some Scene {
         Window("PowerFlow", id: "main") {
             ContentView().environmentObject(monitor)
@@ -363,7 +442,7 @@ struct PowerFlowApp: App {
         MenuBarExtra {
             MenuContent().environmentObject(monitor)
         } label: {
-            Text(monitor.menuTitle).monospacedDigit()
+            monitor.menuLabel.monospacedDigit()
         }
     }
 }
@@ -373,10 +452,14 @@ struct MenuContent: View {
     @Environment(\.openWindow) private var openWindow
     var body: some View {
         if let s = monitor.current {
-            Text(String(format: "Adapter in: %.1f W", s.systemInW))
-            Text(String(format: "Battery: %+.1f W (%d%%)", s.batteryW, s.percent))
-            Text(String(format: "Mac: %.1f W", s.macW))
-            ForEach(s.devices) { d in Text(String(format: "%@: %.1f W", d.label, d.watts)) }
+            if s.adapterConnected {
+                Label(String(format: "Adapter  %.1f W", s.systemInW), systemImage: "powerplug.portrait.fill")
+            }
+            Label(String(format: "Battery  %+.1f W · %d%%", s.batteryW, s.percent), systemImage: batterySymbol(s.percent, charging: false))
+            Label(String(format: "This Mac  %.1f W", s.macW), systemImage: "laptopcomputer")
+            ForEach(s.devices) { d in
+                Label(String(format: "%@  %.1f W", d.label, d.watts) + (d.deviceSoC.map { " · \($0)%" } ?? ""), systemImage: d.symbol)
+            }
             Divider()
         }
         Button("Open PowerFlow") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }

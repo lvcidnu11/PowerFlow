@@ -1,0 +1,16 @@
+{
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name-specializations" : [
+            { "value" : "light.png" },
+            { "appearance" : "dark", "value" : "dark.png" }
+          ],
+          "name" : "PowerFlow"
+        }
+      ]
+    }
+  ],
+  "supported-platforms" : { "squares" : "shared" }
+}

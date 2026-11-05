@@ -1,4 +1,11 @@
-# PowerFlow
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="icon/icon_1024.png">
+    <img src="icon/icon_light_1024.png" width="160" alt="PowerFlow icon">
+  </picture>
+</p>
+
+<h1 align="center">PowerFlow</h1>
 
 A tiny macOS menu bar app that shows, live, where your MacBook's charging power goes:
 **how much goes into the battery, how much the Mac itself uses, and how much goes out to
@@ -9,12 +16,15 @@ devices charging from its USB-C ports** (e.g. an iPhone).
 
 ## Features
 
-- Menu bar readout: `⚡︎86W 🔋+62 📱12` (adapter in · battery · devices)
+- Minimal menu bar readout in SF Symbols: bolt `80W` · battery `+47` · device `11`
+  (adapter in · into/out of battery · each USB-C device)
 - Sankey-style flow diagram: adapter (and battery, when it has to help) → battery / Mac / each USB-C device
+- Recognizes what's plugged in — iPhone, iPad, Apple Watch, AirPods, etc. — and shows its icon,
+  its name and its own battery %
 - Share of input going to each destination, plus Apple's adapter-loss estimate
 - 10-minute history chart
-- Shows the attached device's own battery % when it reports one (iPhone does)
-- No root, no kernel extensions, no network — reads `AppleSmartBattery` from the IORegistry
+- Light and dark app icon that follows the system appearance (macOS 26+)
+- No root, no kernel extensions, no network — reads the IORegistry only
 
 ## Install
 
@@ -46,7 +56,21 @@ public API and may change between macOS versions.
 - Best supported on Apple Silicon MacBooks. Intel Macs expose fewer keys; the app falls back
   to battery voltage × current, and per-port output may be missing.
 - Independently sampled values don't always add up exactly; any gap is shown as
-  "Unaccounted / conversion".
+  "Conversion / other".
+
+**How devices are identified.** Two sources are combined per USB-C port:
+
+| Source | Gives | Needs |
+|---|---|---|
+| USB-C Power Delivery (`FedDetails`) | vendor (e.g. Apple), the device's battery % | any USB-C cable |
+| USB enumeration (`IOUSBHostDevice`) | product name: "iPhone", "iPad", … | a data cable |
+
+The product name picks the icon (iPhone → `iphone`, iPad → `ipad`, …). With a charge-only
+cable the device shows as "Apple device" / "USB-C device" with a generic connector icon.
+Ports are matched by USB controller (one per USB-C port on Apple Silicon).
+
+**Debugging.** `PowerFlow.app/Contents/MacOS/PowerFlow --dump` prints one reading and exits —
+please include its output in bug reports.
 
 **Does charging a phone from the Mac wear the Mac's battery?** While the Mac is plugged in,
 USB-C devices are fed from the system power rail, which the adapter supplies — the battery is
