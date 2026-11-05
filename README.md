@@ -31,9 +31,14 @@ devices charging from its USB-C ports** (e.g. an iPhone).
   and its own battery %
 - Battery health (current vs. design capacity) and cycle count
 - Light and dark app icon that follows the system appearance (macOS 26+)
-- Tiny footprint: about 0.1% CPU and 15 MB of memory; nothing is drawn while the panel is closed,
-  and the menu bar only redraws when its numbers change
-- No root, no kernel extensions, no network — reads the IORegistry only
+- One-click updates: when a new release is out, an **Update** button appears in the panel (and a
+  dot in the menu bar). It downloads the release, checks its SHA-256 and code signature, swaps
+  the app in place and relaunches
+- Tiny footprint: under 0.1% CPU and about 16 MB of memory; nothing is drawn while the panel is
+  closed, and the menu bar only redraws when its numbers change
+- No root, no kernel extensions. Network use is limited to one small request to GitHub on launch
+  and once a day to check for updates — turn it off with
+  `defaults write io.github.powerflow autoCheck -bool false`
 
 ## Install
 
@@ -79,7 +84,8 @@ cable the device shows as "Apple device" / "USB-C device" with a generic connect
 Ports are matched by USB controller (one per USB-C port on Apple Silicon).
 
 **Debugging.** `PowerFlow.app/Contents/MacOS/PowerFlow --dump` prints one reading and exits —
-please include its output in bug reports. `--snapshot <dir>` renders the panel to PNGs.
+please include its output in bug reports. `--update` checks for and installs an update from the
+terminal; `--snapshot <dir>` renders the panel to PNGs.
 
 **Does charging a phone from the Mac wear the Mac's battery?** While the Mac is plugged in,
 USB-C devices are fed from the system power rail, which the adapter supplies — the battery is

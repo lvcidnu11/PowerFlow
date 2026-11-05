@@ -2,6 +2,7 @@
 // AppKit + IOKit only: no SwiftUI/Charts, nothing drawn while the panel is closed,
 // menu bar redrawn only when its text changes, USB rescanned only on plug/unplug.
 import AppKit
+import CryptoKit
 import IOKit
 
 // MARK: - Data
@@ -147,17 +148,22 @@ enum C {
     static let other   = NSColor.systemGray
 }
 
-func batterySymbol(_ p: Int, charging: Bool = false) -> String {
-    if charging && p >= 95 { return "battery.100percent.bolt" }
+/// Plain level glyph only: the menu bar's leading bolt already says "charging".
+func batterySymbol(_ p: Int) -> String {
     return ["battery.0percent", "battery.25percent", "battery.50percent", "battery.75percent", "battery.100percent"][min(4, max(0, (p + 12) / 25))]
 }
 
+private var symbolCache: [String: NSTextAttachment] = [:]
+/// SF Symbol as a text attachment; cached, since rebuilding symbol images on every redraw dominated draw time.
 func symbol(_ name: String, _ color: NSColor? = nil, size: CGFloat = 12) -> NSTextAttachment {
+    let key = "\(name)|\(color?.description ?? "-")|\(size)"
+    if let a = symbolCache[key] { return a }
     var cfg = NSImage.SymbolConfiguration(pointSize: size, weight: .medium)
     if let color { cfg = cfg.applying(.init(paletteColors: [color])) }
     let a = NSTextAttachment()
     a.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
     if let s = a.image?.size { a.bounds = CGRect(x: 0, y: -2, width: s.width, height: s.height) }
+    symbolCache[key] = a
     return a
 }
 
@@ -171,7 +177,7 @@ struct Node { let title: String, symbol: String, watts: Double, color: NSColor }
 
 func nodes(_ r: Reading) -> ([Node], [Node]) {
     var src: [Node] = [], snk: [Node] = []
-    if r.plugged && r.inW > 0.05 { src.append(Node(title: String(format: "Charger · %.0f W", r.ratedW), symbol: "powerplug.portrait.fill", watts: r.inW, color: C.adapter)) }
+    if r.plugged && r.inW > 0.05 { src.append(Node(title: "Charger", symbol: "powerplug.portrait.fill", watts: r.inW, color: C.adapter)) }
     if r.batteryW < -0.05 { src.append(Node(title: "Battery", symbol: batterySymbol(r.percent), watts: -r.batteryW, color: C.battery)) }
     if r.batteryW > 0.05 { snk.append(Node(title: "Battery", symbol: batterySymbol(r.percent), watts: r.batteryW, color: C.battery)) }
     snk.append(Node(title: "This Mac", symbol: "laptopcomputer", watts: r.macW, color: C.mac))
@@ -235,7 +241,10 @@ final class FlowView: NSView {
             if left { let p = NSMutableParagraphStyle(); p.alignment = .right; s.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: s.length)) }
             let w: CGFloat = left ? r.minX - 8 : bounds.width - r.maxX - 8
             let size = s.boundingRect(with: NSSize(width: w, height: 60), options: [.usesLineFragmentOrigin]).size
-            s.draw(with: CGRect(x: left ? r.minX - 8 - w : r.maxX + 8, y: r.midY - size.height / 2, width: w, height: size.height), options: [.usesLineFragmentOrigin])
+            // Top-align with the node (centre it only when the node is shorter than the label),
+            // so tall nodes don't leave an empty band above their label.
+            let y = r.height > size.height ? r.minY - 2 : r.midY - size.height / 2
+            s.draw(with: CGRect(x: left ? r.minX - 8 - w : r.maxX + 8, y: y, width: w, height: size.height), options: [.usesLineFragmentOrigin])
         }
         for (n, r) in zip(src, sr) { label(n, r, left: true) }
         for (n, r) in zip(snk, kr) { label(n, r, left: false) }
@@ -296,7 +305,7 @@ final class HistoryView: NSView {
         let secs = Double(max(n - 1, 0)) * Self.interval
         let span = secs < 60 ? "Last \(Int(secs)) s" : "Last \(Int((secs / 60).rounded())) min"
         text(span, 10, .regular, .secondaryLabelColor).draw(at: NSPoint(x: plot.minX, y: plot.maxY + 4))
-        let scale = text(String(format: "scale %.0f–%.0f W", lo, hi), 10, .regular, .tertiaryLabelColor)
+        let scale = text(String(format: "scale %.0f–%.0f W", lo, hi), 10, .regular, .secondaryLabelColor)
         scale.draw(at: NSPoint(x: plot.maxX - scale.size().width, y: plot.maxY + 4))
     }
 
@@ -313,6 +322,80 @@ final class HistoryView: NSView {
     }
 }
 
+// MARK: - Updates
+
+/// One small HTTPS request to GitHub on launch and then daily; nothing else touches the network.
+/// Turn off with: defaults write io.github.powerflow autoCheck -bool false
+final class Updater {
+    struct Release { let version: String, zip: URL, sha: URL, page: URL }
+    static let feed = URL(string: ProcessInfo.processInfo.environment["POWERFLOW_UPDATE_FEED"]
+                          ?? "https://api.github.com/repos/lvcidnu11/PowerFlow/releases/latest")!
+    let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    private(set) var available: Release?
+    var onChange: (() -> Void)?
+
+    func check() {
+        guard UserDefaults.standard.object(forKey: "autoCheck") as? Bool ?? true else { return }
+        var req = URLRequest(url: Self.feed, timeoutInterval: 20)
+        req.setValue("PowerFlow-updater", forHTTPHeaderField: "User-Agent")
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.finishTasksAndInvalidate() }
+        session.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self, let data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = j["tag_name"] as? String, let assets = j["assets"] as? [[String: Any]] else { return }
+            let v = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            func asset(_ n: String) -> URL? {
+                (assets.first { $0["name"] as? String == n }?["browser_download_url"] as? String).flatMap(URL.init(string:))
+            }
+            guard v.compare(self.current, options: .numeric) == .orderedDescending,
+                  let zip = asset("PowerFlow.zip"), let sha = asset("PowerFlow.zip.sha256") else { return }
+            let page = (j["html_url"] as? String).flatMap(URL.init(string:)) ?? zip
+            DispatchQueue.main.async { self.available = Release(version: v, zip: zip, sha: sha, page: page); self.onChange?() }
+        }.resume()
+    }
+
+    /// Download → verify SHA-256 → unzip → check bundle id, version and signature → swap in place → relaunch.
+    /// If the app can't be replaced where it is (e.g. read-only location), opens the release page instead.
+    func install(status: @escaping (String) -> Void) {
+        guard let rel = available else { return }
+        status("Downloading…")
+        URLSession.shared.downloadTask(with: rel.zip) { file, _, _ in
+            func fail(_ why: String) { DispatchQueue.main.async { status(why); NSWorkspace.shared.open(rel.page) } }
+            guard let file else { return fail("Download failed") }
+            let fm = FileManager.default
+            let dir = fm.temporaryDirectory.appendingPathComponent("PowerFlow-update-\(UUID().uuidString)")
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                let zip = dir.appendingPathComponent("PowerFlow.zip")
+                try fm.moveItem(at: file, to: zip)
+                let expected = try String(contentsOf: rel.sha, encoding: .utf8).prefix(64).lowercased()
+                let actual = SHA256.hash(data: try Data(contentsOf: zip)).map { String(format: "%02x", $0) }.joined()
+                guard expected == actual else { return fail("Checksum mismatch") }
+                guard Self.run("/usr/bin/ditto", "-x", "-k", zip.path, dir.path) else { return fail("Unzip failed") }
+                let new = dir.appendingPathComponent("PowerFlow.app")
+                guard let b = Bundle(url: new), b.bundleIdentifier == Bundle.main.bundleIdentifier,
+                      b.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String == rel.version,
+                      Self.run("/usr/bin/codesign", "--verify", "--deep", new.path) else { return fail("Unexpected download") }
+                _ = try fm.replaceItemAt(Bundle.main.bundleURL, withItemAt: new)
+                DispatchQueue.main.async {
+                    status("Restarting…")
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: "/bin/sh")
+                    p.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", Bundle.main.bundlePath]
+                    try? p.run()
+                    if NSApp.isRunning { NSApp.terminate(nil) } else { exit(0) }
+                }
+            } catch { fail("Couldn't replace the app") }
+        }.resume()
+    }
+
+    private static func run(_ tool: String, _ args: String...) -> Bool {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: tool); p.arguments = args
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit(); return p.terminationStatus == 0
+    }
+}
+
 // MARK: - Panel
 
 final class Panel: NSViewController {
@@ -320,6 +403,7 @@ final class Panel: NSViewController {
     private let percent = NSTextField(labelWithString: ""), status = NSTextField(labelWithString: "")
     private let sub = NSTextField(labelWithString: ""), info = NSTextField(labelWithString: "")
     private let toggle = NSButton(title: "Details", target: nil, action: nil)
+    let update = NSButton(title: "", target: nil, action: nil)
     var onResize: (() -> Void)?
 
     override func loadView() {
@@ -332,7 +416,9 @@ final class Panel: NSViewController {
         toggle.bezelStyle = .inline; toggle.target = self; toggle.action = #selector(toggleDetails)
         toggle.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil); toggle.imagePosition = .imageTrailing
         let quit = NSButton(title: "Quit", target: NSApp, action: #selector(NSApplication.terminate(_:))); quit.bezelStyle = .inline
-        let footer = NSStackView(views: [toggle, NSView(), quit])
+        update.bezelStyle = .inline; update.isHidden = true
+        update.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil); update.imagePosition = .imageLeading
+        let footer = NSStackView(views: [toggle, NSView(), update, quit])
 
         history.isHidden = true; info.isHidden = true
         let stack = NSStackView(views: [header, flow, history, info, footer])
@@ -361,7 +447,7 @@ final class Panel: NSViewController {
         info.stringValue = d.joined(separator: "\n")
     }
 
-    @objc private func toggleDetails() {
+    @objc func toggleDetails() {
         history.isHidden.toggle(); info.isHidden = history.isHidden
         toggle.image = NSImage(systemSymbolName: history.isHidden ? "chevron.down" : "chevron.up", accessibilityDescription: nil)
         if !history.isHidden { history.needsDisplay = true }
@@ -376,6 +462,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover(), panel = Panel()
     private var last: Reading?, lastTitle = ""
+    private let updater = Updater()
 
     func applicationDidFinishLaunching(_ n: Notification) {
         popover.contentViewController = panel
@@ -393,6 +480,28 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
         t.tolerance = 1.5
         RunLoop.main.add(t, forMode: .common)
+
+        updater.onChange = { [weak self] in self?.showUpdate() }
+        panel.update.target = self; panel.update.action = #selector(installUpdate)
+        // Check shortly after launch, then daily; the large tolerance lets macOS batch it with other work.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.updater.check() }
+        let daily = Timer(timeInterval: 86_400, repeats: true) { [weak self] _ in self?.updater.check() }
+        daily.tolerance = 3_600
+        RunLoop.main.add(daily, forMode: .common)
+        if CommandLine.arguments.contains("--open") { DispatchQueue.main.async { self.togglePopover() } }
+    }
+
+    private func showUpdate() {
+        guard let v = updater.available?.version else { return }
+        panel.update.title = "Update to v\(v)"
+        panel.update.isHidden = false
+        // A small dot on the menu bar icon says an update is waiting.
+        lastTitle = ""; if let r = last { updateTitle(r) }
+    }
+
+    @objc private func installUpdate() {
+        panel.update.isEnabled = false
+        updater.install { [weak self] msg in self?.panel.update.title = msg }
     }
 
     private func tick() {
@@ -407,12 +516,13 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func updateTitle(_ r: Reading) {
         var parts: [(String, String)] = []
         if r.plugged { parts.append(("bolt.fill", String(format: "%.0fW", r.inW))) }
-        parts.append((batterySymbol(r.percent, charging: r.batteryW > 0.3), String(format: r.plugged ? "%+.0f" : "%.0fW", r.batteryW)))
+        parts.append((batterySymbol(r.percent), String(format: r.plugged ? "%+.0f" : "%.0fW", r.batteryW)))
         for d in r.devices { parts.append((d.symbol, String(format: "%.0f", d.watts))) }
         let key = parts.map { $0.0 + $0.1 }.joined()
         guard key != lastTitle else { return }  // nothing visible changed
         lastTitle = key
         let s = NSMutableAttributedString()
+        if updater.available != nil { s.append(text("• ", 12, .bold, .controlAccentColor)) }
         for (i, (sym, val)) in parts.enumerated() {
             if i > 0 { s.append(text("  ", 12)) }
             s.append(NSAttributedString(attachment: symbol(sym)))
@@ -458,7 +568,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLi
         p.show(r, health: reader.health, cycles: reader.cycles)
         if CommandLine.arguments.contains("--details") {
             CommandLine.arguments.contains("--demo") ? p.history.seedDemo(r) : p.history.push(r)
-            p.perform(Selector(("toggleDetails")))
+            p.toggleDetails()
         }
         let v = p.view; v.frame.size = v.fittingSize; v.layoutSubtreeIfNeeded()
         let bg = NSView(frame: v.bounds); bg.wantsLayer = true; bg.appearance = v.appearance
@@ -469,6 +579,13 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLi
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(dir)/panel-\(name).png"))
     }
     exit(0)
+}
+if CommandLine.arguments.contains("--update") {  // check and install from the terminal
+    let u = Updater()
+    u.onChange = { print("updating \(u.current) → \(u.available!.version)"); u.install { print($0) } }
+    u.check()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 30) { print("no update (current \(u.current))"); exit(0) }
+    RunLoop.main.run()
 }
 let app = NSApplication.shared
 let delegate = App()

@@ -5,7 +5,7 @@
 set -e
 cd "$(dirname "$0")"
 APP=PowerFlow.app
-VERSION=${VERSION:-1.1.0}
+VERSION=${VERSION:-1.2.0}
 rm -rf $APP build
 mkdir -p $APP/Contents/MacOS build
 for arch in arm64 x86_64; do
