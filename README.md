@@ -14,16 +14,25 @@ devices charging from its USB-C ports** (e.g. an iPhone).
 一个小巧的 macOS 菜单栏工具，实时显示 MacBook 的充电功率去向：多少进了电池、多少被 Mac 自己用掉、
 多少通过 USB-C 输出给了外接设备（比如 iPhone）。
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/panel-dark.png">
+    <img src="docs/panel-light.png" width="380" alt="PowerFlow panel: charger power branching into battery, this Mac and an iPhone">
+  </picture>
+</p>
+
 ## Features
 
-- Minimal menu bar readout in SF Symbols: bolt `80W` · battery `+47` · device `11`
-  (adapter in · into/out of battery · each USB-C device)
-- Sankey-style flow diagram: adapter (and battery, when it has to help) → battery / Mac / each USB-C device
-- Recognizes what's plugged in — iPhone, iPad, Apple Watch, AirPods, etc. — and shows its icon,
-  its name and its own battery %
-- Share of input going to each destination, plus Apple's adapter-loss estimate
-- 10-minute history chart
+- Lives in the menu bar (no Dock icon). Minimal SF Symbols readout: bolt `54W` · battery `+27` · device `10`
+- Click it for a drop-down panel with a branching flow diagram: charger (and battery, when it has
+  to help) → battery / this Mac / each USB-C device. **Details** expands a 10-minute history and
+  charger, cable and battery stats in the same panel
+- Recognizes what's plugged in — iPhone, iPad, Apple Watch, AirPods, etc. — with its icon, name
+  and its own battery %
+- Battery health (current vs. design capacity) and cycle count
 - Light and dark app icon that follows the system appearance (macOS 26+)
+- Tiny footprint: about 0.1% CPU and 15 MB of memory; nothing is drawn while the panel is closed,
+  and the menu bar only redraws when its numbers change
 - No root, no kernel extensions, no network — reads the IORegistry only
 
 ## Install
@@ -37,7 +46,7 @@ devices charging from its USB-C ports** (e.g. an iPhone).
 
 ## Build from source
 
-Requires Xcode command line tools (Swift 5.9+), macOS 14+.
+Requires Xcode command line tools (Swift 5.9+), macOS 14+. Full Xcode 26 adds the light/dark icon.
 
 ```bash
 git clone https://github.com/lvcidnu11/PowerFlow.git
@@ -70,7 +79,7 @@ cable the device shows as "Apple device" / "USB-C device" with a generic connect
 Ports are matched by USB controller (one per USB-C port on Apple Silicon).
 
 **Debugging.** `PowerFlow.app/Contents/MacOS/PowerFlow --dump` prints one reading and exits —
-please include its output in bug reports.
+please include its output in bug reports. `--snapshot <dir>` renders the panel to PNGs.
 
 **Does charging a phone from the Mac wear the Mac's battery?** While the Mac is plugged in,
 USB-C devices are fed from the system power rail, which the adapter supplies — the battery is

@@ -9,9 +9,10 @@ VERSION=${VERSION:-1.1.0}
 rm -rf $APP build
 mkdir -p $APP/Contents/MacOS build
 for arch in arm64 x86_64; do
-  swiftc -O -parse-as-library -target $arch-apple-macosx14.0 PowerFlow.swift -o build/PowerFlow-$arch
+  swiftc -O -wmo -Xlinker -dead_strip -target $arch-apple-macosx14.0 PowerFlow.swift -o build/PowerFlow-$arch
 done
 lipo -create build/PowerFlow-arm64 build/PowerFlow-x86_64 -output $APP/Contents/MacOS/PowerFlow
+strip -x $APP/Contents/MacOS/PowerFlow
 mkdir -p $APP/Contents/Resources
 # Icon: light/dark-aware Icon Composer icon when Xcode's actool is available, else plain .icns
 ICON_NAME_KEY=""
@@ -38,6 +39,7 @@ cat > $APP/Contents/Info.plist <<PLIST
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 $ICON_NAME_KEY
+<key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
