@@ -62,9 +62,14 @@ open PowerFlow.app
 
 ## How it works / caveats
 
-Values come from the undocumented `PowerTelemetryData`, `PowerOutDetails` and `FedDetails`
-keys of `AppleSmartBattery`. They're what Apple's own firmware reports, but they aren't a
-public API and may change between macOS versions.
+Live power figures come from the System Management Controller — `PDTR` (power in from the
+charger) and `PSTR` (whole-system load), updated about once a second; the battery gets the
+difference. Everything else (device names, percent, health, per-port USB-C output) comes from the
+undocumented `PowerTelemetryData`, `PowerOutDetails` and `FedDetails` keys of
+`AppleSmartBattery`, which the battery driver refreshes only about once a minute, so PowerFlow
+re-reads them only when the driver announces an update or a charger is plugged in or out.
+None of this is public API and it may change between macOS versions; on Macs without those SMC
+keys (e.g. Intel), PowerFlow falls back to the once-a-minute driver figures.
 
 - **Mac** is computed as `SystemLoad − USB-C output`.
 - Best supported on Apple Silicon MacBooks. Intel Macs expose fewer keys; the app falls back

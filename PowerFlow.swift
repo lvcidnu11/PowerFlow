@@ -4,6 +4,7 @@
 import AppKit
 import CryptoKit
 import IOKit
+import IOKit.ps
 
 // MARK: - Data
 
@@ -42,6 +43,45 @@ struct Reading: Equatable {
 
 private func num(_ a: Any?) -> Int64 { (a as? NSNumber)?.int64Value ?? 0 }  // int64 keeps signed values intact
 
+/// Live power figures from the System Management Controller (updated ~every second, no root needed).
+/// PDTR = power in from the charger, PSTR = whole-system load. Returns nil where a key is missing (e.g. Intel).
+final class SMC {
+    private struct KeyData {
+        var key: UInt32 = 0
+        var vers = (UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt16(0))
+        var pLimit = (UInt16(0), UInt16(0), UInt32(0), UInt32(0), UInt32(0))
+        var dataSize: UInt32 = 0, dataType: UInt32 = 0, dataAttributes: UInt8 = 0, pad = (UInt8(0), UInt8(0), UInt8(0))
+        var result: UInt8 = 0, status: UInt8 = 0, cmd: UInt8 = 0, data32: UInt32 = 0
+        var bytes: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
+    }
+    private var conn: io_connect_t = 0
+    private var info: [UInt32: (size: UInt32, type: UInt32)] = [:]
+    private static let flt = UInt32(0x666C7420)  // "flt "
+
+    init() {
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+        if svc != 0 { IOServiceOpen(svc, mach_task_self_, 0, &conn); IOObjectRelease(svc) }
+    }
+    private func call(_ k: inout KeyData) -> Bool {
+        var out = KeyData(), size = MemoryLayout<KeyData>.stride
+        guard IOConnectCallStructMethod(conn, 2, &k, size, &out, &size) == KERN_SUCCESS, out.result == 0 else { return false }
+        k = out; return true
+    }
+    func float(_ name: String) -> Double? {
+        guard conn != 0 else { return nil }
+        let key = name.utf8.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+        if info[key] == nil {  // key metadata is fixed; look it up once
+            var k = KeyData(); k.key = key; k.cmd = 9
+            info[key] = call(&k) ? (k.dataSize, k.dataType) : (0, 0)
+        }
+        guard let i = info[key], i.type == Self.flt, i.size == 4 else { return nil }
+        var k = KeyData(); k.key = key; k.cmd = 5; k.dataSize = i.size
+        guard call(&k) else { return nil }
+        let v = Double(Float(bitPattern: UInt32(truncatingIfNeeded: k.bytes.0)))
+        return v.isFinite ? v : nil
+    }
+}
+
 /// Reads only the AppleSmartBattery keys we use (≈4× cheaper than copying the whole dictionary).
 final class Reader {
     private let battery = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
@@ -50,6 +90,10 @@ final class Reader {
     private var usbIterators: [io_iterator_t] = []
     private(set) var health = 0, cycles = 0
     private var healthAge = 1_000  // > refresh threshold, so the first read loads health
+    private let smc = SMC()
+    private var base: Reading?, registryDirty = true
+    /// Called when the battery driver publishes new data or a charger is plugged / unplugged.
+    var onChange: (() -> Void)?
 
     init() {
         // Plug/unplug notifications mark the USB name cache stale; no periodic scanning.
@@ -65,6 +109,19 @@ final class Reader {
             Reader.drain(it)  // arms the notification
             usbIterators.append(it)
         }
+        // The battery driver refreshes its numbers about once a minute and announces each refresh;
+        // re-read the registry only then, instead of on every tick.
+        var note: io_object_t = 0
+        IOServiceAddInterestNotification(port, battery, kIOGeneralInterest, { ctx, _, _, _ in
+            let me = Unmanaged<Reader>.fromOpaque(ctx!).takeUnretainedValue()
+            me.registryDirty = true; me.onChange?()
+        }, me, &note)
+        // Charger plugged / unplugged: react immediately.
+        let ps = IOPSNotificationCreateRunLoopSource({ ctx in
+            let me = Unmanaged<Reader>.fromOpaque(ctx!).takeUnretainedValue()
+            me.registryDirty = true; me.onChange?()
+        }, me).takeRetainedValue()
+        CFRunLoopAddSource(CFRunLoopGetMain(), ps, .commonModes)
     }
 
     private static func drain(_ it: io_iterator_t) { while case let o = IOIteratorNext(it), o != 0 { IOObjectRelease(o) } }
@@ -90,8 +147,22 @@ final class Reader {
         return usbNames
     }
 
+    /// Registry values (re-read only when stale) overlaid with live SMC power figures.
     func read() -> Reading? {
         guard battery != 0 else { return nil }
+        if registryDirty || base == nil { base = readRegistry(); registryDirty = false }
+        guard var r = base else { return nil }
+        if let pin = smc.float("PDTR"), let sys = smc.float("PSTR") {
+            r.plugged = pin > 0.5
+            r.inW = r.plugged ? pin : 0
+            r.loadW = sys
+            r.batteryW = r.inW - sys   // what isn't used by the system goes into (or comes out of) the battery
+            if !r.plugged { r.lossW = 0 }
+        }
+        return r
+    }
+
+    private func readRegistry() -> Reading {
         var r = Reading()
         let tele = prop("PowerTelemetryData") as? [String: Any] ?? [:]
         let adapter = prop("AdapterDetails") as? [String: Any] ?? [:]
@@ -115,7 +186,7 @@ final class Reader {
 
         // Health changes slowly; refresh it about every 10 minutes.
         healthAge += 1
-        if healthAge > 200, let bd = prop("BatteryData") as? [String: Any] {
+        if healthAge > 10, let bd = prop("BatteryData") as? [String: Any] {
             healthAge = 0
             let design = num(bd["DesignCapacity"]), nominal = num(bd["NominalChargeCapacity"])
             health = design > 0 ? Int((Double(nominal) / Double(design) * 100).rounded()) : 0
@@ -259,7 +330,7 @@ final class FlowView: NSView {
 // MARK: - History (fixed-size ring buffer, drawn only when visible)
 
 final class HistoryView: NSView {
-    static let interval = 3.0, capacity = 200  // ≈ 10 min
+    static let interval = 5.0, capacity = 120  // 10 min
     private var series = [[Float]](repeating: [], count: 4)  // charger, battery, mac, devices
     private let colors = [C.adapter, C.battery, C.mac, C.device]
     private let names = ["Charger", "Battery", "Mac", "Devices"]
@@ -479,12 +550,9 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         item.button?.target = self
         item.button?.action = #selector(togglePopover)
+        reader.onChange = { [weak self] in self?.tick() }
         tick()
-        // Battery telemetry refreshes every ~15–60 s, so a 3 s poll with generous tolerance
-        // lets macOS coalesce wake-ups; each read costs ≈ 80 µs.
-        let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
-        t.tolerance = 1.5
-        RunLoop.main.add(t, forMode: .common)
+        schedule(every: 10)
 
         updater.onChange = { [weak self] in self?.showUpdate() }
         panel.update.target = self; panel.update.action = #selector(installUpdate)
@@ -509,29 +577,50 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         updater.install { [weak self] msg in self?.panel.update.title = msg }
     }
 
+    private var timer: Timer?, lastPush = Date.distantPast
+
+    /// Live SMC figures change every second: poll every 2 s while the panel is open, 10 s otherwise
+    /// (plug / unplug still refresh instantly through the power-source notification).
+    /// Tolerance of half the interval lets macOS coalesce the wake-ups.
+    private func schedule(every s: TimeInterval) {
+        timer?.invalidate()
+        let t = Timer(timeInterval: s, repeats: true) { [weak self] _ in self?.tick() }
+        t.tolerance = s / 2
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+    func popoverWillShow(_ n: Notification) { schedule(every: 2) }
+    func popoverDidClose(_ n: Notification) { schedule(every: 10) }
+
     private func tick() {
         guard let r = reader.read() else { return }
-        panel.history.push(r)
+        if Date().timeIntervalSince(lastPush) >= HistoryView.interval - 0.5 { panel.history.push(r); lastPush = Date() }
         guard r != last else { return }
         last = r
         updateTitle(r)
         if popover.isShown { panel.show(r, health: reader.health, cycles: reader.cycles) }
     }
 
+    private var shownValues: [Double] = []
+
     private func updateTitle(_ r: Reading) {
-        var parts: [(String, String)] = []
-        if r.plugged { parts.append(("bolt.fill", String(format: "%.0fW", r.inW))) }
-        parts.append((batterySymbol(r.percent), String(format: r.plugged ? "%+.0f" : "%.0fW", r.batteryW)))
-        for d in r.devices { parts.append((d.symbol, String(format: "%.0f", d.watts))) }
-        let key = parts.map { $0.0 + $0.1 }.joined()
-        guard key != lastTitle else { return }  // nothing visible changed
-        lastTitle = key
+        var parts: [(sym: String, value: Double, fmt: String)] = []
+        if r.plugged { parts.append(("bolt.fill", r.inW, "%.0fW")) }
+        parts.append((batterySymbol(r.percent), r.batteryW, r.plugged ? "%+.0f" : "%.0fW"))
+        for d in r.devices { parts.append((d.symbol, d.watts, "%.0f")) }
+        // Hysteresis: live values wobble ±1 W every second; redraw only when an icon changes
+        // or a number moves by 2 W or more, so the menu bar stays calm and mostly idle.
+        let key = parts.map(\.sym).joined(separator: "|") + (updater.available == nil ? "" : "•")
+        let values = parts.map(\.value)
+        let moved = values.count != shownValues.count || zip(values, shownValues).contains { abs($0 - $1) >= 2 }
+        guard key != lastTitle || moved else { return }
+        lastTitle = key; shownValues = values
         let s = NSMutableAttributedString()
         if updater.available != nil { s.append(text("• ", 12, .bold, .controlAccentColor)) }
-        for (i, (sym, val)) in parts.enumerated() {
+        for (i, p) in parts.enumerated() {
             if i > 0 { s.append(text("  ", 12)) }
-            s.append(NSAttributedString(attachment: symbol(sym)))
-            s.append(text(" " + val, 12, .medium, .controlTextColor))
+            s.append(NSAttributedString(attachment: symbol(p.sym)))
+            s.append(text(" " + String(format: p.fmt, p.value), 12, .medium, .controlTextColor))
         }
         item.button?.attributedTitle = s
     }
